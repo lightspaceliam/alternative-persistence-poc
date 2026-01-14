@@ -13,6 +13,7 @@ using Stub;
 using Stub.Models;
 using System.Data;
 using System.Data.Common;
+using Stub.Services;
 
 var host = Host.CreateDefaultBuilder(args)
 	.ConfigureAppConfiguration((context, config) =>
@@ -41,11 +42,13 @@ var host = Host.CreateDefaultBuilder(args)
 	.ConfigureServices((hostContext, services) =>
 	{
 		services.AddLogging();
-
 		services.AddStackExchangeRedisExtensions<SystemTextJsonSerializer>(new RedisConfiguration
 		{
 			ConnectionString = hostContext.Configuration.GetConnectionString("Redis") ?? throw new NullReferenceException("Redis conn not set"),
 		});
+		
+		services.AddTransient<SnowflakeService>();
+		
 	})
 	.Build();
 
@@ -53,36 +56,20 @@ var configuration = host.Services.GetRequiredService<IConfiguration>();
 
 #region Snowflake
 
+var snowflakeService = host.Services.GetRequiredService<SnowflakeService>();
+
 var snowflakePatients = new List<SnowflakePatient>();
-try
+var dataReader = snowflakeService.Read("SELECT ID, GIVEN, FAMILY FROM PATIENTS LIMIT 10");
+
+//  Contextually aware shaping of the data reader.
+while (dataReader.Read())
 {
-    using IDbConnection conn = new SnowflakeDbConnection();
-    conn.ConnectionString = $"account={configuration["Snowflake:Account"]};user={configuration["Snowflake:Username"]};password={configuration["Snowflake:Password"]};ROLE=ACCOUNTADMIN;db={configuration["Snowflake:DatabaseName"]};schema=PUBLIC";
-    conn.Open();
-
-    Console.WriteLine("Snowflake db connection successfully opened");
-
-
-    using IDbCommand cmd = conn.CreateCommand();
-    cmd.CommandText = "USE WAREHOUSE COMPUTE_WH";
-    cmd.ExecuteNonQuery();
-    cmd.CommandText = "SELECT ID, GIVEN, FAMILY FROM PATIENTS LIMIT 10";
-    IDataReader reader = cmd.ExecuteReader();
-
-    while (reader.Read())
-    {
-        snowflakePatients.Add(new SnowflakePatient
-        {
-            Id = reader.GetString(reader.GetOrdinal("ID")),
-            Given = reader.GetString(reader.GetOrdinal("GIVEN")),
-            Family = reader.GetString(reader.GetOrdinal("FAMILY")),
-        });
-    }
-    conn.Close();
-}
-catch(DbException ex)
-{
-	Console.WriteLine($"Snowflake request exception: {ex.Message}");
+	snowflakePatients.Add(new SnowflakePatient
+	{
+		Id = dataReader.GetString(dataReader.GetOrdinal("ID")),
+		Given = dataReader.GetString(dataReader.GetOrdinal("GIVEN")),
+		Family = dataReader.GetString(dataReader.GetOrdinal("FAMILY")),
+	});
 }
 
 if (!snowflakePatients.Any())

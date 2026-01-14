@@ -5,24 +5,18 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Snowflake.Data.Client;
 using StackExchange.Redis.Extensions.Core.Abstractions;
 using StackExchange.Redis.Extensions.Core.Configuration;
 using StackExchange.Redis.Extensions.System.Text.Json;
 using Stub;
 using Stub.Models;
+using System.Data;
+using System.Data.Common;
 
-/*
- * docker pull redis:latest
- * docker run -d --name local-redis -p 6379:6379 redis:latest
-   
- */
 var host = Host.CreateDefaultBuilder(args)
 	.ConfigureAppConfiguration((context, config) =>
-	{
-		// I can read both, environment variables and user secrets without enabling these two:
-		// config.AddEnvironmentVariables();
-		// config.AddUserSecrets<Program>();
-		
+	{		
 		var environment = context.HostingEnvironment;
 		Console.WriteLine($"Environment: {environment.EnvironmentName}");
 		if (environment.IsDevelopment())
@@ -47,17 +41,67 @@ var host = Host.CreateDefaultBuilder(args)
 	.ConfigureServices((hostContext, services) =>
 	{
 		services.AddLogging();
-		
+
 		services.AddStackExchangeRedisExtensions<SystemTextJsonSerializer>(new RedisConfiguration
 		{
 			ConnectionString = hostContext.Configuration.GetConnectionString("Redis") ?? throw new NullReferenceException("Redis conn not set"),
 		});
-
-		//  We don't need to register Redis.
 	})
 	.Build();
 
-var dbName = "sqlite.db";
+var configuration = host.Services.GetRequiredService<IConfiguration>();
+
+#region Snowflake
+
+var snowflakePatients = new List<SnowflakePatient>();
+try
+{
+    using IDbConnection conn = new SnowflakeDbConnection();
+    conn.ConnectionString = $"account={configuration["Snowflake:Account"]};user={configuration["Snowflake:Username"]};password={configuration["Snowflake:Password"]};ROLE=ACCOUNTADMIN;db={configuration["Snowflake:DatabaseName"]};schema=PUBLIC";
+    conn.Open();
+
+    Console.WriteLine("Snowflake db connection successfully opened");
+
+
+    using IDbCommand cmd = conn.CreateCommand();
+    cmd.CommandText = "USE WAREHOUSE COMPUTE_WH";
+    cmd.ExecuteNonQuery();
+    cmd.CommandText = "SELECT ID, GIVEN, FAMILY FROM PATIENTS LIMIT 10";
+    IDataReader reader = cmd.ExecuteReader();
+
+    while (reader.Read())
+    {
+        snowflakePatients.Add(new SnowflakePatient
+        {
+            Id = reader.GetString(reader.GetOrdinal("ID")),
+            Given = reader.GetString(reader.GetOrdinal("GIVEN")),
+            Family = reader.GetString(reader.GetOrdinal("FAMILY")),
+        });
+    }
+    conn.Close();
+}
+catch(DbException ex)
+{
+	Console.WriteLine($"Snowflake request exception: {ex.Message}");
+}
+
+if (!snowflakePatients.Any())
+{
+	Console.WriteLine("Patients not found");
+	return;
+}
+else {  
+	snowflakePatients.ForEach(p => {
+
+		Console.WriteLine($"Id: {p.Id}, Given: {p.Given}, Family: {p.Family}");
+	});
+}
+
+return;
+
+#endregion Snowflake
+
+#region SQLite
 
 await using var context = new SqLiteDbContext();
 await context.Database.EnsureCreatedAsync();
@@ -86,8 +130,11 @@ else
 	Console.WriteLine($"Patient found: {kylo.Given} {kylo.Family} {kylo.BirthDate}");	
 }
 
-// Console.WriteLine("Hello SqLite!");
 // return;
+
+#endregion SQLite
+
+#region Redis
 
 var redisDatabase = host.Services.GetRequiredService<IRedisDatabase>();
 
@@ -100,10 +147,9 @@ var redisSeedPatients = new List<Patient>
 
 var cached = await redisDatabase.GetAsync<List<Patient>>("patients");
 
-
 if (cached != null)
 {
-	Console.WriteLine("\nCached Patients found\n");
+	Console.WriteLine("\nCached Patients found in Redis\n");
 	foreach (var patient in cached)
 	{
 		Console.WriteLine($"Given: {patient.Given}, Family: {patient.Family}, BirthDate: {patient.BirthDate}");
@@ -111,8 +157,11 @@ if (cached != null)
 }
 else
 {
-	Console.WriteLine("\nCreating cached Patients\n");
+	Console.WriteLine("\nCreating cached Patients in Redis\n");
 	await redisDatabase.AddAsync("patients", redisSeedPatients);
 }
+
+#endregion Redis
+
 Console.WriteLine("Hello, alternative persistence!");
 Console.ReadLine();
